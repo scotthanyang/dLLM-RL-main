@@ -1,0 +1,121 @@
+wandb:
+  entity: null
+  resume: auto
+experiment:
+  project: decode_trace_trace_20260511_005842_evaluation_ex8303_20260511_112110
+  function: evaluation
+  start_from_scratch: true
+  total_step: 50
+  save_every: 10
+  eval_every: 10
+  current_epoch: 1
+  deepspeed_file: 1_node_4_gpus_deepspeed_zero3
+  num_node: 1
+  node_index: 0
+model:
+  pretrained_model: /storage/home/hcoda1/2/mli746/r-phentenryck3-0/dlm_posttrain/dLLM-RL-main/rlmain_dream_trace_20260511_005842/ckpt/optimized_trace
+  optimized_name: optimized_trace
+  model_base: dream
+dataset:
+  train_dataset: MATH_train
+  optimization_data: rl_data
+  data_type: math
+rollout:
+  num_task_per_step: 32
+  num_response_per_task: 16
+  temperature: 0.9
+  alg_temp: 0
+  pad_target_penalty: 1.0
+  steps: 1024
+  max_gen_length: 1024
+  batch_size: 4
+  top_p: 0.9
+  top_k: 50
+  remasking_strategy: low_confidence_dynamic
+  target: confidence
+  dynamic_threshold: 0.9
+  block_size: 32
+  further_horizon: 32
+  use_cache: true
+  enforce_eos_stop: true
+  force_after_first_eos_to_eos: true
+  eos_token_names:
+  - <|im_end|>
+  - <|endoftext|>
+  suppress_eos_at_first_token: false
+  eos_after_continue_invalid: true
+  dynamic_sampling: false
+execute:
+  num_chunk: 128
+training:
+  gradient_accumulation_steps: 64
+  target_optimizer_updates_per_epoch: 1
+  batch_size_lm: 4
+  mixed_precision: bf16
+  enable_tf32: true
+  seed: 10086
+  num_train_epochs: 1
+  max_grad_norm: 1.0
+  method: TraceRL
+  lower_p: 0.1
+  upper_p: 0.9
+  shrink: 8
+  post_num: 0
+  mask_times_per_sample: 35
+  max_gen_length: ${rollout.max_gen_length}
+  max_prompt_len: 512
+  eps: 0.2
+  beta: 0.01
+  use_kl_estimator_k3: true
+  ignore_after_first_eos: false
+  force_after_first_eos_to_eos: true
+  supervise_first_eos: true
+reward:
+  truncate_at_first_eos: true
+  eos_first_invalid: true
+  group_filter_min_success: 0.01
+  group_filter_max_success: 0.99
+optimizer:
+  name: adamw
+  params:
+    learning_rate: 5.0e-07
+    scale_lr: false
+    beta1: 0.9
+    beta2: 0.999
+    weight_decay: 0.0
+    epsilon: 1.0e-08
+lr_scheduler:
+  scheduler: cosine
+  params:
+    learning_rate: 5.0e-07
+    warmup_steps: 0
+    min_lr_scale: 1.0
+evaluation:
+  eval_dataset: MATH500
+  data_type: math
+  num_response_per_task: 1
+  temperature: 0.8
+  alg_temp: 0.0
+  pad_target_penalty: 1.0
+  steps: 1600
+  max_gen_length: 1600
+  batch_size: 1
+  top_p: 0.95
+  top_k: 40
+  remasking_strategy: low_confidence_dynamic
+  target: confidence
+  dynamic_threshold: 0.9
+  block_size: 32
+  further_horizon: 128
+  use_cache: true
+trace:
+  checkpoint_path: /storage/home/hcoda1/2/mli746/r-phentenryck3-0/dlm_posttrain/dLLM-RL-main/rlmain_dream_trace_20260511_005842/ckpt/optimized_trace
+  decode_config_source: evaluation
+  prompt_dataset_source: rollout
+  example_idx: 8303
+  seed: 10086
+  columns_per_row: 8
+  token_width: 14
+  max_blocks: null
+  max_steps_per_block: null
+  output_path: /storage/project/r-phentenryck3-0/mli746/dllm_rl_decode_trace_runs/decode_trace_trace_20260511_005842_evaluation_ex8303_20260511_112110/temp_data/decode_trace_MATH_train_example8303.txt

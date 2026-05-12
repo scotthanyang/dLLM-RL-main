@@ -1,4 +1,4 @@
-from rl_eos import eos_response_metadata, pad_after_first_eos, truncate_text_at_first_eos
+from rl_eos import eos_response_metadata, force_after_first_eos_to_eos, truncate_text_at_first_eos
 
 
 PAD = 0
@@ -9,23 +9,14 @@ C = 12
 D = 13
 
 
-def training_mask(response_ids, supervise_first_eos=True):
-    labels = list(response_ids)
+def training_mask(response_ids):
+    labels, _ = force_after_first_eos_to_eos(response_ids, [EOS])
     p_mask = [True] * len(response_ids)
-    try:
-        eos_idx = response_ids.index(EOS)
-    except ValueError:
-        return labels, p_mask
-
-    inactive_start = eos_idx + 1 if supervise_first_eos else eos_idx
-    for idx in range(inactive_start, len(response_ids)):
-        labels[idx] = -100
-        p_mask[idx] = False
     return labels, p_mask
 
 
 def run_case(name, response_ids, response_text):
-    padded_ids, first_eos = pad_after_first_eos(response_ids, [EOS], PAD)
+    forced_ids, first_eos = force_after_first_eos_to_eos(response_ids, [EOS])
     metadata = eos_response_metadata(
         response_ids,
         eos_token_ids=[EOS],
@@ -36,10 +27,10 @@ def run_case(name, response_ids, response_text):
     reward_text = truncate_text_at_first_eos(
         response_text, ["<EOS>"], include_eos=False
     )
-    labels, p_mask = training_mask(response_ids, supervise_first_eos=True)
+    labels, p_mask = training_mask(response_ids)
     print(f"{name}:")
     print(f"  raw_ids={response_ids}")
-    print(f"  padded_after_eos={padded_ids}")
+    print(f"  forced_after_eos={forced_ids}")
     print(f"  first_eos_index={first_eos}")
     print(f"  reward_text={reward_text!r}")
     print(f"  eos_then_continues={metadata['eos_then_continues']}")
@@ -55,8 +46,8 @@ def main():
         "Case A", [A, B, EOS, C, D], "a b <EOS> c d"
     )
     assert reward_text == "a b "
-    assert labels == [A, B, EOS, -100, -100]
-    assert p_mask == [True, True, True, False, False]
+    assert labels == [A, B, EOS, EOS, EOS]
+    assert p_mask == [True, True, True, True, True]
     assert metadata["eos_then_continues"] is True
 
     metadata, reward_text, labels, p_mask = run_case(
@@ -64,8 +55,8 @@ def main():
     )
     assert reward_text == ""
     assert metadata["eos_first"] is True
-    assert labels == [EOS, -100, -100]
-    assert p_mask == [True, False, False]
+    assert labels == [EOS, EOS, EOS]
+    assert p_mask == [True, True, True]
 
     metadata, reward_text, labels, p_mask = run_case(
         "Case C", [A, B, C], "a b c"

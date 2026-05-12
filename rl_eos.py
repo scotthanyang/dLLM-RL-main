@@ -146,3 +146,13 @@ def pad_after_first_eos(token_ids, eos_token_ids, pad_token_id):
     result[first_idx + 1 :] = [int(pad_token_id)] * max(len(result) - first_idx - 1, 0)
     return result, first_idx
 
+
+def force_after_first_eos_to_eos(token_ids, eos_token_ids):
+    first_idx = first_eos_index(token_ids, eos_token_ids)
+    if first_idx is None:
+        return list(token_ids), first_idx
+    result = list(token_ids)
+    eos_fill_id = int(result[first_idx])
+    result[first_idx + 1 :] = [eos_fill_id] * max(len(result) - first_idx - 1, 0)
+    return result, first_idx
+

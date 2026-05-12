@@ -131,6 +131,7 @@ def _sample(
     unmask_threshold: float = 0.9,
     remasking_strategy: Union[str, ListConfig] = "low_confidence_dynamic",
     enforce_eos_stop: bool = True,
+    force_after_first_eos_to_eos: bool = True,
     suppress_eos_at_first_token: bool = False,
 ) -> Union[DreamModelOutput, torch.LongTensor]:
     # init values
@@ -250,7 +251,11 @@ def _sample(
             tail_content = (tail != pad_token_id) & (tail != mask_token_id) & ~tokens_in(tail, eos_ids)
             if tail_content.any():
                 eos_then_continues[row] = True
-            tail.fill_(pad_token_id)
+            if force_after_first_eos_to_eos:
+                fill_token_id = int(gen[row, first_pos].item())
+            else:
+                fill_token_id = int(pad_token_id)
+            tail.fill_(fill_token_id)
 
     # Process each block
     for num_block in range(num_blocks):
@@ -592,6 +597,10 @@ def worker(pretrained_model, rank, prompts, orig_idx, seq_dict, step_dict, token
         OmegaConf.select(config, "rollout.suppress_eos_at_first_token", default=False),
         default=False,
     )
+    force_after_first_eos_to_eos = as_bool(
+        OmegaConf.select(config, "rollout.force_after_first_eos_to_eos", default=True),
+        default=True,
+    )
 
     # process in chunks of `batch_size`
     for start in tqdm(range(0, len(prompts), batch_size),
@@ -654,6 +663,7 @@ def worker(pretrained_model, rank, prompts, orig_idx, seq_dict, step_dict, token
             unmask_threshold = unmask_threshold,
             remasking_strategy = remasking_strategy,
             enforce_eos_stop = enforce_eos_stop,
+            force_after_first_eos_to_eos = force_after_first_eos_to_eos,
             suppress_eos_at_first_token = suppress_eos_at_first_token,
         )
         generation_ids.sequences = generation_ids.sequences.cpu()
@@ -757,19 +767,35 @@ if __name__ == "__main__":
     with open("../data/" + dataset + ".json", 'r') as f:
         data = json.load(f)
     #data = [data[i] for i in range(50)]
+    for source_idx, item in enumerate(data):
+        item["source_idx"] = source_idx
 
     num_node = config.experiment.num_node
     node_index = config.experiment.node_index
-    if num_node > 1:
+    fixed_task_indices = None
+    if config.experiment.function == "train":
+        fixed_task_indices = OmegaConf.select(
+            config, "rollout.fixed_task_indices", default=None
+        )
+        if fixed_task_indices is not None:
+            fixed_task_index_set = {int(x) for x in fixed_task_indices}
+            data = [
+                item
+                for item in data
+                if int(item.get("source_idx", -1)) in fixed_task_index_set
+            ]
+
+    if num_node > 1 and fixed_task_indices is None:
         if config.experiment.function == "train":
             random.shuffle(data)
         data = get_data_chunk(data, num_node, node_index)
     
     if config.experiment.function == "train":
-        random_select_num = config.rollout.num_task_per_step
-        random_select_num = int(random_select_num / num_node)
-        random_select_num = min(random_select_num, len(data))
-        data = random_select(data, random_select_num)
+        if fixed_task_indices is None:
+            random_select_num = config.rollout.num_task_per_step
+            random_select_num = int(random_select_num / num_node)
+            random_select_num = min(random_select_num, len(data))
+            data = random_select(data, random_select_num)
     num = len(data)
 
     tokenizer = DreamTokenizer.from_pretrained(pretrained_model, trust_remote_code=True)
@@ -919,10 +945,18 @@ if __name__ == "__main__":
         item["truncated_response"] if item["truncated_response"] is not None else restored_outputs[i]
         for i, item in enumerate(eos_metadata)
     ]
-    training_outputs = [
-        item["training_response"] if item["training_response"] is not None else truncated_outputs[i]
-        for i, item in enumerate(eos_metadata)
-    ]
+    train_on_forced_eos_tail = as_bool(
+        OmegaConf.select(config, "rollout.force_after_first_eos_to_eos", default=True),
+        default=True,
+    )
+    training_outputs = []
+    for i, item in enumerate(eos_metadata):
+        if train_on_forced_eos_tail:
+            training_outputs.append(restored_outputs[i])
+        elif item["training_response"] is not None:
+            training_outputs.append(item["training_response"])
+        else:
+            training_outputs.append(truncated_outputs[i])
     response_length = [int(item["valid_response_length"]) for item in eos_metadata]
     mean_response_length = sum(response_length) / len(response_length)
     rollout_metrics = [

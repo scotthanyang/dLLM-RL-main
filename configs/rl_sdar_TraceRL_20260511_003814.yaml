@@ -1,0 +1,110 @@
+wandb:
+  entity: null
+  resume: auto
+experiment:
+  project: rl_sdar_TraceRL_20260511_003814
+  function: train
+  start_from_scratch: true
+  total_step: 80
+  save_every: 10
+  eval_every: 10
+  current_epoch: 1
+  deepspeed_file: 1_node_2_gpus_deepspeed_zero2
+  num_node: 1
+  node_index: 0
+  main_process_port: 21481
+  checkpoints_total_limit: 2
+model:
+  pretrained_model: /storage/project/r-phentenryck3-0/mli746/hf_models/JetLM/SDAR-8B-Chat-b32
+  optimized_name: optimized_TraceRL
+  model_base: sdar
+dataset:
+  train_dataset: MATH_train
+  optimization_data: rl_data
+  data_type: math
+rollout:
+  tensor_parallel_size: 1
+  max_active: 64
+  num_task_per_step: 16
+  num_response_per_task: 8
+  temperature: 1.0
+  max_token: 2000
+  block_size: 32
+  denoising_steps_per_block: 32
+  top_p: 1.0
+  top_k: 0
+  remasking_strategy: low_confidence_dynamic
+  dynamic_threshold: 0.9
+  start_with_think: false
+  dynamic_task_sampling_enable: false
+execute:
+  num_chunk: 128
+training:
+  gradient_checkpointing_enable: true
+  gradient_accumulation_steps: 32
+  batch_size_lm: 2
+  mixed_precision: bf16
+  enable_tf32: true
+  seed: 10086
+  num_train_epochs: 1
+  max_grad_norm: 1.0
+  method: TraceRL
+  block_size: 4
+  shrink: 1
+  post_num: 0
+  max_gen_length: 2000
+  max_prompt_len: 784
+  lower_p: 0.1
+  upper_p: 0.9
+  eps: 0.2
+  beta: 0.01
+  use_kl_estimator_k3: true
+optimizer:
+  name: adamw
+  params:
+    learning_rate: 1.0e-06
+    scale_lr: false
+    beta1: 0.9
+    beta2: 0.999
+    weight_decay: 0.0
+    epsilon: 1.0e-08
+lr_scheduler:
+  scheduler: cosine
+  params:
+    learning_rate: 1.0e-06
+    warmup_steps: 0
+    min_lr_scale: 1.0
+evaluation:
+  eval_dataset: MATH500
+  data_type: math
+  tensor_parallel_size: 1
+  max_active: 16
+  num_response_per_task: 3
+  temperature: 1.0
+  max_token: 2000
+  block_size: 4
+  denoising_steps_per_block: 32
+  top_p: 1.0
+  top_k:
+  - 0
+  - 1
+  remasking_strategy:
+  - low_confidence_dynamic
+  - low_confidence_static
+  dynamic_threshold: 0.9
+  start_with_think: false
+reward:
+  use_length_penalty: true
+  length_penalty_weight: 0.0
+  length_penalty_threshold_ratio: 0.3
+  length_penalty_threshold_tokens: 300
+  length_penalty_power: 2.0
+  length_penalty_cap: 1.0
+  length_penalty_apply_to_all_samples: true
+  hard_overlong_invalidate: true
+  hard_overlong_margin: 5
+  group_filter_enable: true
+  group_filter_min_success: 0.2
+  group_filter_max_success: 0.8
+  correctness_lower_bound: 0.01
+  correctness_upper_bound: 0.99

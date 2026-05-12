@@ -212,7 +212,11 @@ def main():
     )
     eos_token_ids = resolve_eos_token_ids(tokenizer, eos_token_names)
     ignore_after_first_eos = as_bool(
-        OmegaConf.select(config, "training.ignore_after_first_eos", default=True),
+        OmegaConf.select(config, "training.ignore_after_first_eos", default=False),
+        default=False,
+    )
+    force_after_first_eos_to_eos = as_bool(
+        OmegaConf.select(config, "training.force_after_first_eos_to_eos", default=True),
         default=True,
     )
     supervise_first_eos = as_bool(
@@ -297,7 +301,7 @@ def main():
         loss_active_mask_lm = input_ids_lm.ne(pad_id)
         loss_active_mask_lm[:, :start_pos] = False
 
-        if ignore_after_first_eos and eos_token_ids:
+        if (ignore_after_first_eos or force_after_first_eos_to_eos) and eos_token_ids:
             eos_set = {int(token_id) for token_id in eos_token_ids}
             for b in range(input_ids_lm.shape[0]):
                 response_ids = input_ids_lm[b, start_pos:]
@@ -311,13 +315,24 @@ def main():
 
                 eos_pos = start_pos + first_eos
                 inactive_start = eos_pos + 1 if supervise_first_eos else eos_pos
-                if inactive_start < input_ids_lm.shape[1]:
-                    input_ids_lm[b, inactive_start:] = pad_id
-                    labels_lm[b, inactive_start:] = -100
-                    loss_active_mask_lm[b, inactive_start:] = False
-                if not supervise_first_eos:
-                    labels_lm[b, eos_pos] = -100
-                    loss_active_mask_lm[b, eos_pos] = False
+                if force_after_first_eos_to_eos:
+                    if inactive_start < input_ids_lm.shape[1]:
+                        tail_active = loss_active_mask_lm[b, inactive_start:]
+                        eos_fill_id = int(input_ids_lm[b, eos_pos].item())
+                        tail_input_ids = input_ids_lm[b, inactive_start:]
+                        tail_labels = labels_lm[b, inactive_start:]
+                        tail_input_ids[tail_active] = eos_fill_id
+                        tail_labels[tail_active] = eos_fill_id
+                    continue
+
+                if ignore_after_first_eos:
+                    if inactive_start < input_ids_lm.shape[1]:
+                        input_ids_lm[b, inactive_start:] = pad_id
+                        labels_lm[b, inactive_start:] = -100
+                        loss_active_mask_lm[b, inactive_start:] = False
+                    if not supervise_first_eos:
+                        labels_lm[b, eos_pos] = -100
+                        loss_active_mask_lm[b, eos_pos] = False
     
         
         lower = config.training.lower_p
@@ -991,6 +1006,91 @@ def main():
             ],
         )
 
+    def temp_nan_debug_input_stats(debug_context, input_ids, labels, p_mask_lm, attn_mask, start_pos):
+        if debug_context is None:
+            return
+        def get_vocab_size():
+            for candidate in (model, getattr(model, "module", None)):
+                if candidate is None:
+                    continue
+                cfg = getattr(candidate, "config", None)
+                if isinstance(cfg, dict) and cfg.get("vocab_size") is not None:
+                    return int(cfg["vocab_size"])
+                value = getattr(cfg, "vocab_size", None)
+                if value is not None:
+                    return int(value)
+            value = getattr(tokenizer, "vocab_size", None)
+            if value is not None:
+                return int(value)
+            try:
+                return int(len(tokenizer))
+            except TypeError:
+                return None
+
+        B, T = input_ids.shape
+        idx = torch.arange(T, device=input_ids.device)
+        active_per_sample = p_mask_lm.bool().sum(dim=1)
+        pad_per_sample = (input_ids == pad_id).sum(dim=1)
+        prompt_pad_per_sample = ((input_ids == pad_id) & (idx[None, :] <= start_pos)).sum(dim=1)
+        response_pad_per_sample = ((input_ids == pad_id) & (idx[None, :] > start_pos)).sum(dim=1)
+        eos_positions = []
+        eos_set = {int(token_id) for token_id in eos_token_ids}
+        for b in range(B):
+            first_eos = None
+            for pos, token_id in enumerate(input_ids[b, start_pos:].tolist(), start=start_pos):
+                if int(token_id) in eos_set:
+                    first_eos = pos
+                    break
+            eos_positions.append(-1 if first_eos is None else first_eos)
+
+        active_labels = labels[p_mask_lm.bool()]
+        vocab_size = get_vocab_size()
+        bad_input = input_ids < 0
+        if vocab_size is not None:
+            bad_input = bad_input | (input_ids >= vocab_size)
+        bad_input_count = int(bad_input.sum().item())
+        if active_labels.numel():
+            bad_active_labels = (active_labels < 0) | (active_labels == pad_id)
+            if vocab_size is not None:
+                bad_active_labels = bad_active_labels | (active_labels >= vocab_size)
+            bad_active_label_count = int(bad_active_labels.sum().item())
+        else:
+            bad_active_label_count = 0
+
+        attn_finite = torch.isfinite(attn_mask).all().item() if torch.is_tensor(attn_mask) else True
+        all_masked_rows = 0
+        allowed_key_min = allowed_key_max = None
+        if torch.is_tensor(attn_mask):
+            allowed = torch.isfinite(attn_mask) & (attn_mask == 0)
+            if allowed.dim() == 4:
+                allowed_counts = allowed.sum(dim=-1)
+                all_masked_rows = int((allowed_counts == 0).sum().item())
+                allowed_key_min = int(allowed_counts.min().item())
+                allowed_key_max = int(allowed_counts.max().item())
+            elif allowed.dim() == 2:
+                allowed_counts = allowed.sum(dim=-1)
+                all_masked_rows = int((allowed_counts == 0).sum().item())
+                allowed_key_min = int(allowed_counts.min().item())
+                allowed_key_max = int(allowed_counts.max().item())
+
+        temp_nan_debug_print(
+            debug_context,
+            "pre_forward_inputs",
+            [
+                f"input_shape={tuple(input_ids.shape)} start_pos={start_pos}",
+                f"vocab_size={vocab_size}",
+                f"bad_input_id_count={bad_input_count}",
+                f"bad_active_label_count={bad_active_label_count}",
+                f"pad_per_sample={pad_per_sample.detach().cpu().tolist()}",
+                f"prompt_pad_per_sample={prompt_pad_per_sample.detach().cpu().tolist()}",
+                f"response_pad_per_sample={response_pad_per_sample.detach().cpu().tolist()}",
+                f"first_eos_global_per_sample={eos_positions}",
+                f"active_p_mask_per_sample={active_per_sample.detach().cpu().tolist()}",
+                f"attention_mask_is_tensor={torch.is_tensor(attn_mask)} finite={bool(attn_finite)} "
+                f"all_masked_rows={all_masked_rows} allowed_key_min={allowed_key_min} allowed_key_max={allowed_key_max}",
+            ],
+        )
+
     def forward_process(
         input_ids, labels, p_mask_lm,
         start_pos,
@@ -1001,7 +1101,17 @@ def main():
         adv = torch.as_tensor(adv, device=input_ids.device).detach()
 
         attn_mask = make_attention_mask(input_ids, pad_id, start_pos)
+        if temp_nan_debug_should_print(debug_context, [input_ids.float(), labels.float(), p_mask_lm.float(), attn_mask]):
+            temp_nan_debug_input_stats(debug_context, input_ids, labels, p_mask_lm, attn_mask, start_pos)
         logits = model(input_ids, attention_mask=attn_mask, is_causal=False).logits
+        if temp_nan_debug_should_print(debug_context, [logits]):
+            temp_nan_debug_print(
+                debug_context,
+                "post_forward_logits",
+                [temp_nan_debug_tensor_stats("logits", logits)],
+            )
+            if not torch.isfinite(logits.detach()).all().item():
+                temp_nan_debug_param_stats(debug_context, "params_after_nonfinite_logits")
 
         B, T, V = logits.shape
 
@@ -1028,6 +1138,7 @@ def main():
                 debug_context,
                 "pre_log_softmax",
                 [
+                    temp_nan_debug_tensor_stats("logits", logits),
                     temp_nan_debug_tensor_stats("adv", adv),
                     temp_nan_debug_tensor_stats("shift_mask", shift_mask.float()),
                     temp_nan_debug_tensor_stats("active_labels", active_labels.float()),

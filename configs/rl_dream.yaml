@@ -31,6 +31,10 @@ dataset:
 rollout:
     num_task_per_step: 32
     num_response_per_task: 8
+    dynamic_sampling: False
+    dynamic_task_sampling_enable: False
+    # Optional safety cap. Null/0 means keep refilling until enough prompts qualify.
+    dynamic_sampling_max_attempts: null
     temperature: 0.8
     alg_temp: 0
     pad_target_penalty: 1.0
@@ -46,6 +50,7 @@ rollout:
     further_horizon: 32
     use_cache: True
     enforce_eos_stop: True
+    force_after_first_eos_to_eos: True
     eos_token_names: ["<|im_end|>", "<|endoftext|>"]
     suppress_eos_at_first_token: False
     eos_after_continue_invalid: True
@@ -73,7 +78,8 @@ training:
     eps: 0.20
     beta: 0.01
     use_kl_estimator_k3: True
-    ignore_after_first_eos: True
+    ignore_after_first_eos: False
+    force_after_first_eos_to_eos: True
     supervise_first_eos: True
 
 reward:

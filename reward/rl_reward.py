@@ -225,10 +225,13 @@ if __name__ == "__main__":
         if config.experiment.function == "train":
 
             proportion = sum(correctness) / len(correctness)
-            if (
+            group_filtered = (
                 proportion > group_filter_max_success
                 or proportion < group_filter_min_success
-            ):
+            )
+            data[i]["group_success_rate"] = proportion
+            data[i]["group_filtered"] = bool(group_filtered)
+            if group_filtered:
                 continue
             qualified_prompt_count += 1
 
@@ -247,6 +250,10 @@ if __name__ == "__main__":
                     data[i], "raw_full_output", j, data[i]["full_output"][j]
                 )
                 data_i["step_map"] = data[i]["step_map"][j]
+                data_i["response_length"] = lengths[j]
+                data_i["correctness"] = bool(correctness[j])
+                if "source_idx" in data[i]:
+                    data_i["source_idx"] = data[i]["source_idx"]
                 for key in (
                     "first_eos_index",
                     "first_eos_global_index",

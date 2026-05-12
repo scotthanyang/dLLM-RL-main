@@ -1,6 +1,7 @@
 import os
 import sys
 import json
+import random
 import subprocess
 from termcolor import cprint
 from rl_metrics import aggregate_rollout_metrics, format_metrics
@@ -57,8 +58,21 @@ if __name__ == "__main__":
             init_value_model(1, config)
             optimized_value_model = "../" + project_name + "/ckpt/" + config.model.optimized_value_name
             begin_with(f"{project_name}/results/results-rl-" + optimized_value_model.replace("/", ".") + "-" + config.dataset.train_dataset + ".txt")
-    
-    def sample(i, type, block_size = None, top_k = None, remasking_strategy = None):
+
+    def _format_cli_task_indices(task_indices):
+        if task_indices is None:
+            return "null"
+        return "[" + ",".join(str(int(x)) for x in task_indices) + "]"
+
+    def _get_optimization_data_path():
+        return f"{project_name}/temp_data/{config.dataset.optimization_data}.json"
+
+    def _load_train_task_ids():
+        with open(f"data/{config.dataset.train_dataset}.json", "r") as f:
+            data = json.load(f)
+        return list(range(len(data)))
+
+    def sample(i, type, block_size = None, top_k = None, remasking_strategy = None, task_indices = None):
         if model_base == "dream":
             script_name = "dream_rl_rollout.py"
         elif model_base == "llada" or model_base == "mmada":
@@ -67,6 +81,11 @@ if __name__ == "__main__":
             script_name = "sdar_rl_rollout.py"
         elif model_base == "trado":
             script_name = "trado_rl_rollout.py"
+        fixed_task_arg = ""
+        if task_indices is not None:
+            fixed_task_arg = (
+                f"rollout.fixed_task_indices='{_format_cli_task_indices(task_indices)}' "
+            )
         subprocess.run(
             f'python {script_name} '
             f'config=../configs/{project_name}.yaml '
@@ -74,6 +93,7 @@ if __name__ == "__main__":
             f"evaluation.block_size={block_size} "
             f"evaluation.top_k={top_k} "
             f"evaluation.remasking_strategy={remasking_strategy} "
+            f"{fixed_task_arg}"
             f'experiment.current_epoch={i} ',
             shell=True,
             cwd='sample',
@@ -170,26 +190,13 @@ if __name__ == "__main__":
         aggregate_stats,
         target_prompt_count,
         qualified_prompt_count,
-        attempts,
-        raw_reward,
-        raw_total_reward,
+        rounds,
+        batch_stats,
         rollout_metrics,
     ):
         outputs_name = get_train_outputs_name(i)
         outputs_result_name = f"{project_name}/results/results-{outputs_name}.txt"
         os.makedirs(os.path.dirname(outputs_result_name), exist_ok=True)
-
-        attempted_response_count = aggregate_stats["attempted_response_count"]
-        acc = (
-            aggregate_stats["correct_count"] / attempted_response_count
-            if attempted_response_count
-            else 0
-        )
-        avg_len = (
-            aggregate_stats["response_length_sum"] / attempted_response_count
-            if attempted_response_count
-            else 0
-        )
 
         output_text = f"train step: {i}  "
         if config.model.model_base != "sdar" and config.model.model_base != "trado":
@@ -204,32 +211,76 @@ if __name__ == "__main__":
             )
         output_text += (
             f"qualified prompts: {qualified_prompt_count}/{target_prompt_count}  "
-            f"sampling attempts: {attempts}  "
-            f"acc: {acc}  avg length: {avg_len}  "
-            f"raw reward: {raw_reward}  raw total reward: {raw_total_reward}"
+            f"sampling rounds: {rounds}  "
+            f"sampled prompts: {aggregate_stats['attempted_prompt_count']}  "
+            f"filtered prompts: {aggregate_stats['attempted_prompt_count'] - qualified_prompt_count}  "
+            f"accepted responses: {batch_stats['response_count']}  "
+            f"acc: {batch_stats['acc']}  avg length: {batch_stats['avg_len']}  "
+            f"raw reward: {batch_stats['raw_reward']}  "
+            f"raw total reward: {batch_stats['raw_total_reward']}"
         )
         rollout_text = format_metrics(rollout_metrics)
         if rollout_text:
             output_text += "  " + rollout_text
 
         cprint("\n\n\n" + output_text, color="green")
+        sys.stdout.flush()
         with open(outputs_result_name, "a") as f:
             f.write(output_text + "\n")
+
+    def _summarize_train_records(records):
+        response_count = len(records)
+        correct_count = sum(int(bool(item.get("raw_reward", 0))) for item in records)
+        raw_total_reward = float(
+            sum(float(item.get("raw_reward", 0.0)) for item in records)
+        )
+
+        length_sum = 0.0
+        for item in records:
+            if item.get("valid_response_length") is not None:
+                length_sum += float(item["valid_response_length"])
+            elif item.get("response_length") is not None:
+                length_sum += float(item["response_length"])
+            else:
+                length_sum += float(item.get("rollout_metrics", {}).get("response_len", 0.0))
+
+        source_ids = {
+            int(item["source_idx"])
+            for item in records
+            if item.get("source_idx") is not None
+        }
+        return {
+            "prompt_count": len(source_ids),
+            "response_count": response_count,
+            "correct_count": correct_count,
+            "response_length_sum": length_sum,
+            "acc": correct_count / response_count if response_count else 0,
+            "avg_len": length_sum / response_count if response_count else 0,
+            "raw_reward": raw_total_reward / response_count if response_count else 0,
+            "raw_total_reward": raw_total_reward,
+        }
 
     def dynamic_train_rollout(i):
         target_prompt_count = int(config.rollout.num_task_per_step / config.experiment.num_node)
         target_prompt_count = max(target_prompt_count, 1)
-        responses_per_prompt = int(config.rollout.num_response_per_task)
-        target_response_count = target_prompt_count * responses_per_prompt
         max_attempts = int(
             OmegaConf.select(config, "rollout.dynamic_sampling_max_attempts", default=0) or 0
         )
 
-        optimization_path = f"{project_name}/temp_data/{config.dataset.optimization_data}.json"
+        all_task_ids = _load_train_task_ids()
+        seed_base = OmegaConf.select(config, "rollout.rollout_seed", default=None)
+        if seed_base is None:
+            seed_base = OmegaConf.select(config, "training.seed", default=0)
+        rng = random.Random(int(seed_base) + int(i))
+        rng.shuffle(all_task_ids)
+
+        optimization_path = _get_optimization_data_path()
         stats_path = f"{project_name}/temp_data/reward_stats-train-step{i}.json"
         accumulated_data = []
+        accepted_task_id_set = set()
+        tried_task_id_set = set()
         qualified_prompt_count = 0
-        attempts = 0
+        rounds = 0
         aggregate_stats = {
             "attempted_prompt_count": 0,
             "attempted_response_count": 0,
@@ -238,14 +289,34 @@ if __name__ == "__main__":
         }
 
         while qualified_prompt_count < target_prompt_count:
-            attempts += 1
-            if max_attempts and attempts > max_attempts:
+            rounds += 1
+            if max_attempts and rounds > max_attempts:
                 raise RuntimeError(
                     f"dynamic sampling reached rollout.dynamic_sampling_max_attempts={max_attempts} "
                     f"with {qualified_prompt_count}/{target_prompt_count} qualified prompts"
                 )
 
-            sample(i, "train")
+            remaining_prompt_count = target_prompt_count - qualified_prompt_count
+            candidate_task_ids = [
+                task_id for task_id in all_task_ids if task_id not in tried_task_id_set
+            ][:remaining_prompt_count]
+            if not candidate_task_ids:
+                raise RuntimeError(
+                    "dynamic sampling exhausted the train dataset after "
+                    f"{rounds - 1} rounds: accepted "
+                    f"{qualified_prompt_count}/{target_prompt_count} prompts"
+                )
+
+            tried_task_id_set.update(candidate_task_ids)
+            cprint(
+                f"[dynamic_sampling] step={i} round={rounds} requesting "
+                f"{len(candidate_task_ids)} new prompts "
+                f"(accepted={qualified_prompt_count}/{target_prompt_count})",
+                "cyan",
+            )
+            sys.stdout.flush()
+
+            sample(i, "train", task_indices=candidate_task_ids)
             if is_code_task:
                 execute(i, "train")
             reward(i, "train", is_code_task, report_metrics=False)
@@ -258,39 +329,83 @@ if __name__ == "__main__":
             for key in ("attempted_prompt_count", "attempted_response_count", "correct_count"):
                 aggregate_stats[key] += int(stats.get(key, 0))
             aggregate_stats["response_length_sum"] += float(stats.get("response_length_sum", 0.0))
-
-            accepted_prompt_count = int(stats.get("qualified_prompt_count", 0))
-            remaining_prompt_count = target_prompt_count - qualified_prompt_count
-            prompts_to_add = min(accepted_prompt_count, remaining_prompt_count)
-            responses_to_add = prompts_to_add * responses_per_prompt
-            if responses_to_add:
-                accumulated_data.extend(accepted_data[:responses_to_add])
-                qualified_prompt_count += prompts_to_add
-
-            cprint(
-                f"dynamic sampling attempt {attempts}: "
-                f"{qualified_prompt_count}/{target_prompt_count} qualified prompts",
-                "yellow",
+            round_attempted = int(stats.get("attempted_response_count", 0))
+            round_acc = (
+                int(stats.get("correct_count", 0)) / round_attempted
+                if round_attempted
+                else 0
+            )
+            round_avg_len = (
+                float(stats.get("response_length_sum", 0.0)) / round_attempted
+                if round_attempted
+                else 0
             )
 
-        accumulated_data = accumulated_data[:target_response_count]
-        raw_total_reward = float(
-            sum(float(item.get("raw_reward", 0.0)) for item in accumulated_data)
-        )
-        raw_reward = raw_total_reward / len(accumulated_data) if accumulated_data else 0
+            records_by_source = {}
+            for item in accepted_data:
+                source_idx = item.get("source_idx")
+                if source_idx is None:
+                    raise KeyError(
+                        "Dynamic task sampling requires reward records to include 'source_idx'."
+                    )
+                records_by_source.setdefault(int(source_idx), []).append(item)
+
+            round_accepted = []
+            for source_idx in candidate_task_ids:
+                if source_idx in accepted_task_id_set:
+                    continue
+                records = records_by_source.get(int(source_idx), [])
+                if not records:
+                    continue
+                accepted_task_id_set.add(int(source_idx))
+                round_accepted.append(int(source_idx))
+                accumulated_data.extend(records)
+
+            qualified_prompt_count = len(accepted_task_id_set)
+
+            cprint(
+                f"[dynamic_sampling] step={i} round={rounds} accepted "
+                f"{len(round_accepted)}/{len(candidate_task_ids)} prompts; "
+                f"total={qualified_prompt_count}/{target_prompt_count}; "
+                f"round acc: {round_acc}  round avg length: {round_avg_len}",
+                "cyan",
+            )
+            sys.stdout.flush()
+
+        batch_stats = _summarize_train_records(accumulated_data)
         rollout_metrics = aggregate_rollout_metrics(accumulated_data)
         os.makedirs(os.path.dirname(optimization_path), exist_ok=True)
         with open(optimization_path, "w", encoding="utf-8") as f:
             json.dump(accumulated_data, f, indent=2, ensure_ascii=False)
+        dynamic_stats = {
+            "current_epoch": int(i),
+            "function": "train",
+            "dynamic_sampling": True,
+            "target_prompt_count": target_prompt_count,
+            "qualified_prompt_count": qualified_prompt_count,
+            "sampling_rounds": rounds,
+            "attempted_prompt_count": aggregate_stats["attempted_prompt_count"],
+            "attempted_response_count": aggregate_stats["attempted_response_count"],
+            "attempted_correct_count": aggregate_stats["correct_count"],
+            "attempted_response_length_sum": aggregate_stats["response_length_sum"],
+            "final_prompt_count": batch_stats["prompt_count"],
+            "final_response_count": batch_stats["response_count"],
+            "final_correct_count": batch_stats["correct_count"],
+            "final_response_length_sum": batch_stats["response_length_sum"],
+            "raw_reward": batch_stats["raw_reward"],
+            "raw_total_reward": batch_stats["raw_total_reward"],
+            "rollout_metrics": rollout_metrics,
+        }
+        with open(stats_path, "w", encoding="utf-8") as f:
+            json.dump(dynamic_stats, f, indent=2)
 
         write_dynamic_train_metrics(
             i,
             aggregate_stats,
             target_prompt_count,
             qualified_prompt_count,
-            attempts,
-            raw_reward,
-            raw_total_reward,
+            rounds,
+            batch_stats,
             rollout_metrics,
         )
     
@@ -309,9 +424,16 @@ if __name__ == "__main__":
     while i <= config.experiment.total_step:
         
         
-        dynamic_sampling = parse_bool(
-            OmegaConf.select(config, "rollout.dynamic_sampling", default=True)
+        dynamic_sampling_default = OmegaConf.select(
+            config, "rollout.dynamic_task_sampling_enable", default=False
         )
+        dynamic_sampling = parse_bool(
+            OmegaConf.select(
+                config, "rollout.dynamic_sampling", default=dynamic_sampling_default
+            )
+        )
+        if dynamic_sampling and model_base != "dream":
+            raise ValueError("rollout.dynamic_sampling is currently implemented for Dream RL only.")
 
         if is_process_reward or is_code_task or not dynamic_sampling:
             sample(i, "train")
@@ -361,6 +483,3 @@ if __name__ == "__main__":
                     reward(i, "evaluation", is_code_task, block_size = block_size, top_k = top_k, remasking_strategy = remasking_strategy)
 
         i += 1
-
-
-
